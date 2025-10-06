@@ -1,22 +1,28 @@
 // SPDX-License-Identifier: MIT
-pragma solidity >=0.8.2 <0.9.0;
+pragma solidity ^0.8.24;
 
-/**
- * @title KipuBank
- * @author Seu Nome
- * @notice Um contrato de banco simples e seguro para depositar e sacar ETH.
- */
-contract KipuBank {
-    // STATE VARIABLES
+import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/access/AccessControl.sol";
+import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/utils/ReentrancyGuard.sol";
 
-    /// @notice The maximum amount of ETH a user can withdraw in a single transaction.
-    uint256 public immutable withdrawalLimit;
+contract KipuBankV2 is AccessControl, ReentrancyGuard {
+    // ROLES DEFINITION
+    
+    /// @notice Manages the bankCap and withdrawalLimit
+    bytes32 public constant OPS_MANAGER_ROLE = keccak256("OPS_MANAGER_ROLE");
 
-    /// @notice The maximum total amount of ETH that can be deposited into the entire bank.
-    uint256 public immutable bankCap;
+
+    // STATE VARIABLES 
+
+    /// @notice The maximum amount of ETH a user can withdraw in a single transaction, can be changed by the OPSManager.
+    uint256 public withdrawalLimit;
+
+    /// @notice The maximum total amount of ETH that can be deposited into the entire bank, can be changed by the OPSManager.
+    uint256 public  bankCap;
 
     /// @notice Maps a user's address to their balance in the bank.
+    // mapping(address => mapping(address => uint256)) public balances;
     mapping(address => uint256) public balances;
+    mapping(address => address) public tokenPriceFeeds;
 
     /// @notice The total amount of ETH currently held by the contract.
     uint256 public totalSupply;
@@ -31,6 +37,7 @@ contract KipuBank {
 
     event Deposit(address indexed user, uint256 amount);
     event Withdrawal(address indexed user, uint256 amount);
+    event CapsUpdated(uint256 bankCap, uint256 withdrawalLimit);
 
     // ERRORS
 
@@ -44,13 +51,6 @@ contract KipuBank {
 
     // MODIFIER
 
-    uint256 private _locked; // 0 = unlocked, 1 = locked
-    modifier nonReentrant() {
-        if (_locked == 1) revert Reentrancy();
-            _locked = 1;
-        _;
-            _locked = 0;
-    }
 
     modifier whenDepositAllowed(uint256 _amount) {
         if (_amount == 0) revert DepositAmountIsZero();
@@ -58,13 +58,24 @@ contract KipuBank {
         if (attemptedTotal > bankCap) revert BankCapExceeded(bankCap, attemptedTotal);
         _;
     }
-
     // CONSTRUCTOR
 
-    constructor(uint256 _initialBankCap, uint256 _initialWithdrawalLimit) {
+    constructor(uint256 _initialBankCap, uint256 _initialWithdrawalLimit, address admin) {
+        if (_initialBankCap == 0 || _initialWithdrawalLimit == 0) revert();
         bankCap = _initialBankCap;
         withdrawalLimit = _initialWithdrawalLimit;
-        _locked = 0; // Explicitly set unlocked state
+        
+        // Set admin
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+        _grantRole(OPS_MANAGER_ROLE, admin);
+    }
+
+    ///OPS_MANAGER setCaps function
+    function setCaps(uint256 _bankCap, uint256 _withdrawalLimit) external onlyRole(OPS_MANAGER_ROLE)
+    {
+        bankCap = _bankCap;
+        withdrawalLimit = _withdrawalLimit;
+        emit CapsUpdated(_bankCap, _withdrawalLimit);
     }
 
     // EXTERNAL FUNCTIONS
@@ -74,7 +85,7 @@ contract KipuBank {
         // Effects
         balances[msg.sender] += msg.value;
         totalSupply += msg.value;
-        depositCount++;
+        ++depositCount;
 
         // Emit event
         emit Deposit(msg.sender, msg.value);
@@ -97,7 +108,7 @@ contract KipuBank {
         // Effects - State changes happen before external call
         balances[msg.sender] = userBalance - _amount;
         totalSupply -= _amount;
-        withdrawalCount++;
+        ++withdrawalCount;
     
         // Emit event before external call as a good practice
         emit Withdrawal(msg.sender, _amount);
@@ -121,4 +132,6 @@ contract KipuBank {
     ) {
         return (bankCap, withdrawalLimit, totalSupply, depositCount, withdrawalCount);
     }
+
+    receive() external payable { revert("Use deposit()"); }
 }
