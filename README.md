@@ -1,8 +1,5 @@
 # KipuBankV2
 
-contract creation Address: https://sepolia.etherscan.io/tx/0x6e158f9f5af53300751a8e510f273ab6f8ee4f64c7587be47d730546276703dd
-# KipuBankV2: An Advanced Multi-Token Smart Contract Bank
-
 ## Introduction
 
 The primary goal of this project is to demonstrate the application of advanced Solidity patterns, security best practices, and integration with external data sources to build a contract that is both feature-rich and secure.
