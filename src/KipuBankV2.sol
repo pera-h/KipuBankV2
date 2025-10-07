@@ -77,8 +77,21 @@ contract KipuBankV2 is AccessControl, ReentrancyGuard {
     }
 
     function recoverBalance(address _tokenAddress, address _user, uint256 _newBalance) external onlyRole(FUNDS_RECOVERY_ROLE) {
-        balances[_tokenAddress][_user] = _newBalance;
+        uint256 oldBalance = balances[_tokenAddress][_user];
 
+        if (_newBalance > oldBalance) {
+            uint256 diff = _newBalance - oldBalance;
+            uint256 valueDiffInUsd = _getValueInUsd(_tokenAddress, diff);
+            totalBankValueInUsd += valueDiffInUsd;
+        } 
+
+        else if (_newBalance < oldBalance) {
+            uint256 diff = oldBalance - _newBalance;
+            uint256 valueDiffInUsd = _getValueInUsd(_tokenAddress, diff);
+            totalBankValueInUsd -= valueDiffInUsd;
+        }
+
+        balances[_tokenAddress][_user] = _newBalance;
         emit BalanceRecovered(msg.sender, _user, _tokenAddress, _newBalance);
     }
 
