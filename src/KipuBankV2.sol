@@ -12,21 +12,32 @@ interface IERC20Metadata is IERC20 {
     function symbol() external view returns (string memory);
     function decimals() external view returns (uint8);
 }
-
+/// @title KipuBankV2
+/// @author pera-h
 contract KipuBankV2 is AccessControl, ReentrancyGuard {
-    /// @notice roles
+    /// @notice roles for access control
     bytes32 public constant OPERATIONS_MANAGER_ROLE = keccak256("OPERATIONS_MANAGER_ROLE");
     bytes32 public constant ASSET_MANAGER_ROLE = keccak256("ASSET_MANAGER_ROLE");
     bytes32 public constant FUNDS_RECOVERY_ROLE = keccak256("FUNDS_RECOVERY_ROLE");
 
     /// @notice statevariables
+
+    /// @notice The maximum total value of all assets the bank can hold, in USD with 8 decimals.
     uint256 public bankCapInUsd;
+
+    /// @notice The maximum value a user can withdraw in a single transaction, in USD with 8 decimals.
     uint256 public withdrawalLimitInUsd;
+    
+    /// @notice The current total value of all assets held by the bank, in USD with 8 decimals.
     uint256 public totalBankValueInUsd;
 
+    /// @notice Mapping from token address to user address to the user's balance.
     mapping(address => mapping(address => uint256)) public balances;
+    
+    /// @notice Mapping from a supported token address to its Chainlink price feed address.
     mapping(address => address) public tokenPriceFeeds;
 
+    /// @notice A constant to represent native Ether, following the EIP-7528
     address public constant ETH_ADDRESS = address(0);
 
     /// @notice Events
@@ -53,6 +64,7 @@ contract KipuBankV2 is AccessControl, ReentrancyGuard {
         bankCapInUsd = _initialBankCapInUsd;
         withdrawalLimitInUsd = _initialWithdrawalLimitInUsd;
 
+        // Grant all roles to the deployer.
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(OPERATIONS_MANAGER_ROLE, msg.sender);
         _grantRole(ASSET_MANAGER_ROLE, msg.sender);
@@ -60,22 +72,27 @@ contract KipuBankV2 is AccessControl, ReentrancyGuard {
     }
 
     /// @notice Rules-related functions
+
+    /// @notice Updates the total bank value cap.
     function setBankCapInUsd(uint256 _newCap) external onlyRole(OPERATIONS_MANAGER_ROLE) {
         bankCapInUsd = _newCap;
         emit BankCapUpdated(_newCap);
     }
 
+    /// @notice Updates the per-transaction withdrawal limit.
     function setWithdrawalLimitInUsd(uint256 _newLimit) external onlyRole(OPERATIONS_MANAGER_ROLE) {
         withdrawalLimitInUsd = _newLimit;
         emit WithdrawalLimitUpdated(_newLimit);
     }
 
+    /// @notice Adds a new token to the list of supported assets by providing its price feed.
     function addToken(address _tokenAddress, address _priceFeedAddress) external onlyRole(ASSET_MANAGER_ROLE) {
         if (_priceFeedAddress == address(0)) revert InvalidAmount();
         tokenPriceFeeds[_tokenAddress] = _priceFeedAddress;
         emit TokenAdded(_tokenAddress, _priceFeedAddress);
     }
 
+    /// @notice Manually adjusts a user's balance for recovery purposes.
     function recoverBalance(address _tokenAddress, address _user, uint256 _newBalance) external onlyRole(FUNDS_RECOVERY_ROLE) {
         uint256 oldBalance = balances[_tokenAddress][_user];
 
@@ -96,6 +113,8 @@ contract KipuBankV2 is AccessControl, ReentrancyGuard {
     }
 
     /// @notice deposit and withdrawal multi-token
+
+    /// @notice Deposits ETH or a supported ERC20 token into the bank.
     function deposit(address _tokenAddress, uint256 _amount) external payable nonReentrant {
         if (_amount == 0) revert InvalidAmount();
         
@@ -103,6 +122,7 @@ contract KipuBankV2 is AccessControl, ReentrancyGuard {
             revert TokenNotSupported(_tokenAddress);
         }
 
+        // Check if the deposit would exceed the bank's total value cap.
         uint256 depositValueInUsd = _getValueInUsd(_tokenAddress, _amount);
         if (totalBankValueInUsd + depositValueInUsd > bankCapInUsd) {
             revert BankCapExceeded(totalBankValueInUsd, depositValueInUsd, bankCapInUsd);
@@ -124,6 +144,7 @@ contract KipuBankV2 is AccessControl, ReentrancyGuard {
         emit Deposit(msg.sender, _tokenAddress, _amount);
     }
 
+    /// @notice Withdraws ETH or a supported ERC20 token from the bank.
     function withdraw(address _tokenAddress, uint256 _amount) external nonReentrant {
         if (_amount == 0) revert InvalidAmount();
         uint256 userBalance = balances[_tokenAddress][msg.sender];
@@ -149,6 +170,9 @@ contract KipuBankV2 is AccessControl, ReentrancyGuard {
         emit Withdrawal(msg.sender, _tokenAddress, _amount);
     }
 
+    /// @notice internal helper functions
+
+    /// @notice (Internal) Fetches the token price and normalizes it to 8 decimals.
     function _getPriceUsd8(address _tokenAddress) internal view returns (uint256 price8) {
         address feedAddr = tokenPriceFeeds[_tokenAddress];
         if (feedAddr == address(0)) revert TokenNotSupported(_tokenAddress);
@@ -157,23 +181,25 @@ contract KipuBankV2 is AccessControl, ReentrancyGuard {
         (, int256 answer,,,) = feed.latestRoundData();
         if (answer <= 0) revert InvalidPriceFeed(_tokenAddress);
 
-        uint8 pdec = feed.decimals(); // pode ser 8 (mais comum) ou outro
+        uint8 pdec = feed.decimals();
         uint256 u = uint256(answer);
         if (pdec > 8)       price8 = u / (10 ** (pdec - 8));
         else if (pdec < 8)  price8 = u * (10 ** (8 - pdec));
         else                price8 = u;
     }
 
+    /// @notice (Internal) Gets the number of decimals for a given token.
     function _getTokenDecimals(address _tokenAddress) internal view returns (uint8) {
         if (_tokenAddress == ETH_ADDRESS) return 18;
         return IERC20Metadata(_tokenAddress).decimals();
     }
 
+    /// @notice (Internal) Calculates the USD value of a given amount of a token.
     function _getValueInUsd(address _tokenAddress, uint256 _amount) internal view returns (uint256) {
         if (_amount == 0) return 0;
-        uint256 price8 = _getPriceUsd8(_tokenAddress);     // USD com 8 casas
-        uint8 tdec = _getTokenDecimals(_tokenAddress);     // decimais do token
-        // amount(10^tdec) * price(10^8) / 10^tdec => 10^8
-        return (_amount * price8) / (10 ** uint256(tdec)); // retorna USD com 8 casas
+        uint256 price8 = _getPriceUsd8(_tokenAddress);
+        uint8 tdec = _getTokenDecimals(_tokenAddress); 
+        
+        return (_amount * price8) / (10 ** uint256(tdec));
     }
 }
