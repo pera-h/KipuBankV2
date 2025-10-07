@@ -6,11 +6,18 @@ import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contr
 import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC20/IERC20.sol";
 import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 
+// @dev Interface for the optional metadata functions of the ERC20 standard.
+interface IERC20Metadata is IERC20 {
+    function name() external view returns (string memory);
+    function symbol() external view returns (string memory);
+    function decimals() external view returns (uint8);
+}
 
 contract KipuBankV2 is AccessControl, ReentrancyGuard {
     /// @notice roles
     bytes32 public constant OPERATIONS_MANAGER_ROLE = keccak256("OPERATIONS_MANAGER_ROLE");
     bytes32 public constant ASSET_MANAGER_ROLE = keccak256("ASSET_MANAGER_ROLE");
+    bytes32 public constant FUNDS_RECOVERY_ROLE = keccak256("FUNDS_RECOVERY_ROLE");
 
     /// @notice statevariables
     uint256 public bankCapInUsd;
@@ -28,7 +35,8 @@ contract KipuBankV2 is AccessControl, ReentrancyGuard {
     event TokenAdded(address indexed token, address indexed priceFeed);
     event BankCapUpdated(uint256 newCapInUsd);
     event WithdrawalLimitUpdated(uint256 newLimitInUsd);
-
+    event BalanceRecovered(address indexed admin, address indexed user, address indexed token, uint256 newBalance);
+    
     /// @notice errors
     error TokenNotSupported(address token);
     error InvalidAmount();
@@ -36,6 +44,9 @@ contract KipuBankV2 is AccessControl, ReentrancyGuard {
     error TransferFailed();
     error MsgValueMustBeZeroForErc20();
     error AmountDoesNotMatchMsgValue();
+    error WithdrawalAmountExceedsUsdLimit(uint256 amountInUsd, uint256 limitInUsd);
+    error BankCapExceeded(uint256 currentTotalValue, uint256 depositValue, uint256 bankCap);
+    error InvalidPriceFeed(address token);
 
     /// @notice constructor, grant all important roles to admin
     constructor(uint256 _initialBankCapInUsd, uint256 _initialWithdrawalLimitInUsd) {
@@ -45,6 +56,7 @@ contract KipuBankV2 is AccessControl, ReentrancyGuard {
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(OPERATIONS_MANAGER_ROLE, msg.sender);
         _grantRole(ASSET_MANAGER_ROLE, msg.sender);
+        _grantRole(FUNDS_RECOVERY_ROLE, msg.sender);
     }
 
     /// @notice Rules-related functions
@@ -64,20 +76,38 @@ contract KipuBankV2 is AccessControl, ReentrancyGuard {
         emit TokenAdded(_tokenAddress, _priceFeedAddress);
     }
 
+    function recoverBalance(address _tokenAddress, address _user, uint256 _newBalance) external onlyRole(FUNDS_RECOVERY_ROLE) {
+        balances[_tokenAddress][_user] = _newBalance;
+
+        emit BalanceRecovered(msg.sender, _user, _tokenAddress, _newBalance);
+    }
+
     /// @notice deposit and withdrawal multi-token
     function deposit(address _tokenAddress, uint256 _amount) external payable nonReentrant {
         if (_amount == 0) revert InvalidAmount();
+        
+        if (_tokenAddress != ETH_ADDRESS && tokenPriceFeeds[_tokenAddress] == address(0)) {
+            revert TokenNotSupported(_tokenAddress);
+        }
+
+        uint256 depositValueInUsd = _getValueInUsd(_tokenAddress, _amount);
+        if (totalBankValueInUsd + depositValueInUsd > bankCapInUsd) {
+            revert BankCapExceeded(totalBankValueInUsd, depositValueInUsd, bankCapInUsd);
+        }
 
         if (_tokenAddress == ETH_ADDRESS) {
             if (msg.value != _amount) revert AmountDoesNotMatchMsgValue();
         } else {
             if (msg.value > 0) revert MsgValueMustBeZeroForErc20();
-            
             bool success = IERC20(_tokenAddress).transferFrom(msg.sender, address(this), _amount);
             if (!success) revert TransferFailed();
         }
 
         balances[_tokenAddress][msg.sender] += _amount;
+        
+        totalBankValueInUsd += depositValueInUsd;
+
+
         emit Deposit(msg.sender, _tokenAddress, _amount);
     }
 
@@ -86,7 +116,14 @@ contract KipuBankV2 is AccessControl, ReentrancyGuard {
         uint256 userBalance = balances[_tokenAddress][msg.sender];
         if (userBalance < _amount) revert InsufficientBalance(userBalance, _amount);
 
+        uint256 amountInUsd = _getValueInUsd(_tokenAddress, _amount);
+        if (amountInUsd > withdrawalLimitInUsd) {
+            revert WithdrawalAmountExceedsUsdLimit(amountInUsd, withdrawalLimitInUsd);
+        }
+
         balances[_tokenAddress][msg.sender] -= _amount;
+
+        totalBankValueInUsd -= amountInUsd;
 
         if (_tokenAddress == ETH_ADDRESS) {
             (bool success, ) = msg.sender.call{value: _amount}("");
@@ -97,5 +134,33 @@ contract KipuBankV2 is AccessControl, ReentrancyGuard {
         }
 
         emit Withdrawal(msg.sender, _tokenAddress, _amount);
+    }
+
+    function _getPriceUsd8(address _tokenAddress) internal view returns (uint256 price8) {
+        address feedAddr = tokenPriceFeeds[_tokenAddress];
+        if (feedAddr == address(0)) revert TokenNotSupported(_tokenAddress);
+
+        AggregatorV3Interface feed = AggregatorV3Interface(feedAddr);
+        (, int256 answer,,,) = feed.latestRoundData();
+        if (answer <= 0) revert InvalidPriceFeed(_tokenAddress);
+
+        uint8 pdec = feed.decimals(); // pode ser 8 (mais comum) ou outro
+        uint256 u = uint256(answer);
+        if (pdec > 8)       price8 = u / (10 ** (pdec - 8));
+        else if (pdec < 8)  price8 = u * (10 ** (8 - pdec));
+        else                price8 = u;
+    }
+
+    function _getTokenDecimals(address _tokenAddress) internal view returns (uint8) {
+        if (_tokenAddress == ETH_ADDRESS) return 18;
+        return IERC20Metadata(_tokenAddress).decimals();
+    }
+
+    function _getValueInUsd(address _tokenAddress, uint256 _amount) internal view returns (uint256) {
+        if (_amount == 0) return 0;
+        uint256 price8 = _getPriceUsd8(_tokenAddress);     // USD com 8 casas
+        uint8 tdec = _getTokenDecimals(_tokenAddress);     // decimais do token
+        // amount(10^tdec) * price(10^8) / 10^tdec => 10^8
+        return (_amount * price8) / (10 ** uint256(tdec)); // retorna USD com 8 casas
     }
 }
